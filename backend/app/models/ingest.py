@@ -4,6 +4,11 @@ from typing import Generic, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.cloud_events import HowData, WhatVehicleData, WhereData, WhoData, WhyData
+from app.models.cloud_events import (
+    GoodsReceivedItemData,
+    GoodsReceivedVerifiedCloudEvent,
+    GoodsReceivedVerifiedData,
+)
 
 
 class ReceiptContext(BaseModel):
@@ -40,6 +45,20 @@ class VehicleReceivedIngestRequest(IngestBaseRequest):
 
 class VehicleInspectedIngestRequest(IngestBaseRequest):
     inspection: InspectionContext
+
+
+class GoodsReceivedVerifiedIngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    specversion: Literal["1.0"] = "1.0"
+    type: Literal["com.arista.inventory.goods_received.verified"] = (
+        "com.arista.inventory.goods_received.verified"
+    )
+    source: str = Field(min_length=1, max_length=255)
+    subject: str = Field(min_length=1, max_length=128)
+    id: str = Field(min_length=1, max_length=128)
+    time: datetime
+    data: GoodsReceivedVerifiedData
 
 
 TCloudEvent = TypeVar("TCloudEvent")

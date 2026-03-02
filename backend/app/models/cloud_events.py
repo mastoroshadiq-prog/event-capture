@@ -94,3 +94,30 @@ class VehicleInspectedCloudEvent(CloudEventBase):
     type: Literal["vehicle.inspected"] = "vehicle.inspected"
     data: VehicleInspectedEventData
 
+
+class GoodsReceivedItemData(BaseModel):
+    product_id: str = Field(min_length=1, max_length=64)
+    vin_number: str = Field(min_length=17, max_length=17)
+    condition_notes: str = Field(min_length=1, max_length=500)
+    landed_cost_actual: float = Field(ge=0)
+
+
+class GoodsReceivedVerifiedData(BaseModel):
+    vendor_id: str = Field(min_length=1, max_length=64)
+    operator_id: str = Field(min_length=1, max_length=64)
+    item_list: GoodsReceivedItemData
+
+
+class GoodsReceivedVerifiedCloudEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    specversion: Literal["1.0"] = "1.0"
+    type: Literal["com.arista.inventory.goods_received.verified"] = (
+        "com.arista.inventory.goods_received.verified"
+    )
+    source: str = Field(min_length=1, max_length=255)
+    subject: str = Field(min_length=1, max_length=128)
+    id: str = Field(min_length=1, max_length=128)
+    time: datetime
+    data: GoodsReceivedVerifiedData
+

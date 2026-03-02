@@ -2,12 +2,17 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.models.cloud_events import (
+    GoodsReceivedVerifiedCloudEvent,
     VehicleInspectedCloudEvent,
     VehicleInspectedEventData,
     VehicleReceivedCloudEvent,
     VehicleReceivedEventData,
 )
-from app.models.ingest import VehicleInspectedIngestRequest, VehicleReceivedIngestRequest
+from app.models.ingest import (
+    GoodsReceivedVerifiedIngestRequest,
+    VehicleInspectedIngestRequest,
+    VehicleReceivedIngestRequest,
+)
 
 
 def _resolve_correlation_id(request_value: str | None, header_value: str | None) -> str:
@@ -92,5 +97,22 @@ def build_vehicle_inspected_cloudevent(
         deviceid=payload.how.device_id,
         correlationid=correlation_id,
         data=event_data,
+    )
+
+
+def build_goods_received_verified_cloudevent(
+    payload: GoodsReceivedVerifiedIngestRequest,
+    idempotency_key: str | None,
+) -> GoodsReceivedVerifiedCloudEvent:
+    event_id = _resolve_event_id(idempotency_key)
+
+    return GoodsReceivedVerifiedCloudEvent(
+        specversion=payload.specversion,
+        type=payload.type,
+        source=payload.source,
+        subject=payload.subject,
+        id=event_id,
+        time=payload.time,
+        data=payload.data,
     )
 

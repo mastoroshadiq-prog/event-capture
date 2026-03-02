@@ -2,13 +2,15 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, status
 
-from app.models.cloud_events import VehicleInspectedCloudEvent, VehicleReceivedCloudEvent
+from app.models.cloud_events import GoodsReceivedVerifiedCloudEvent, VehicleInspectedCloudEvent, VehicleReceivedCloudEvent
 from app.models.ingest import (
+    GoodsReceivedVerifiedIngestRequest,
     IngestAcceptedResponse,
     VehicleInspectedIngestRequest,
     VehicleReceivedIngestRequest,
 )
 from app.services.event_factory import (
+    build_goods_received_verified_cloudevent,
     build_vehicle_inspected_cloudevent,
     build_vehicle_received_cloudevent,
 )
@@ -27,22 +29,22 @@ router = APIRouter(prefix="/v1/events", tags=["events"])
 
 @router.post(
     "/vehicle-received",
-    response_model=IngestAcceptedResponse[VehicleReceivedCloudEvent],
+    response_model=IngestAcceptedResponse[GoodsReceivedVerifiedCloudEvent],
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def ingest_vehicle_received(
-    payload: VehicleReceivedIngestRequest,
+    payload: GoodsReceivedVerifiedIngestRequest,
     x_correlation_id: str | None = Header(default=None),
     x_idempotency_key: str | None = Header(default=None),
     auth_context: AuthContext = Depends(get_auth_context),
-) -> IngestAcceptedResponse[VehicleReceivedCloudEvent]:
+) -> IngestAcceptedResponse[GoodsReceivedVerifiedCloudEvent]:
     idempotency_key = x_idempotency_key.strip() if x_idempotency_key else None
     correlation_id = x_correlation_id.strip() if x_correlation_id else None
 
     enforce_ingest_authorization(
         auth_context,
-        payload_operator_id=payload.who.operator_id,
-        payload_device_id=payload.how.device_id,
+        payload_operator_id=payload.data.operator_id,
+        payload_device_id="mobile-scanner",
     )
 
     payload_hash = build_payload_hash(payload)
@@ -51,14 +53,14 @@ async def ingest_vehicle_received(
         idempotency_key=idempotency_key,
         event_type="vehicle.received",
         payload_hash=payload_hash,
-        model_type=VehicleReceivedCloudEvent,
+        model_type=GoodsReceivedVerifiedCloudEvent,
     )
     if existing_event is not None:
-        return IngestAcceptedResponse[VehicleReceivedCloudEvent](
+        return IngestAcceptedResponse[GoodsReceivedVerifiedCloudEvent](
             status="accepted",
             event_type=existing_event.cloud_event.type,
             event_id=existing_event.cloud_event.id,
-            correlation_id=existing_event.cloud_event.correlationid,
+            correlation_id=correlation_id or existing_event.cloud_event.id,
             accepted_at=datetime.now(timezone.utc),
             publish_status=existing_event.publish_status,
             publish_attempts=existing_event.publish_attempts,
@@ -67,9 +69,8 @@ async def ingest_vehicle_received(
             cloud_event=existing_event.cloud_event,
         )
 
-    cloud_event = build_vehicle_received_cloudevent(
+    cloud_event = build_goods_received_verified_cloudevent(
         payload=payload,
-        header_correlation_id=correlation_id,
         idempotency_key=idempotency_key,
     )
 
@@ -79,10 +80,10 @@ async def ingest_vehicle_received(
     try:
         publish_result = publisher.publish(
             cloud_event,
-            correlation_id=cloud_event.correlationid,
+            correlation_id=correlation_id or cloud_event.id,
             event_id=cloud_event.id,
             event_type=cloud_event.type,
-            partition_key=cloud_event.data.what.vin or cloud_event.data.what.shipment_id,
+            partition_key=cloud_event.data.item_list.vin_number,
         )
         publish_status = "published"
         publish_attempts = publish_result.attempts
@@ -93,7 +94,7 @@ async def ingest_vehicle_received(
             cloud_event=cloud_event,
             reason="redpanda_publish_failed",
             error_message=str(error),
-            correlation_id=cloud_event.correlationid,
+            correlation_id=correlation_id or cloud_event.id,
             event_id=cloud_event.id,
             event_type=cloud_event.type,
         )
@@ -113,11 +114,11 @@ async def ingest_vehicle_received(
         dead_letter_id=dead_letter_id,
     )
 
-    return IngestAcceptedResponse[VehicleReceivedCloudEvent](
+    return IngestAcceptedResponse[GoodsReceivedVerifiedCloudEvent](
         status="accepted",
         event_type=cloud_event.type,
         event_id=cloud_event.id,
-        correlation_id=cloud_event.correlationid,
+        correlation_id=correlation_id or cloud_event.id,
         accepted_at=datetime.now(timezone.utc),
         publish_status=publish_status,
         publish_attempts=publish_attempts,
