@@ -1,6 +1,42 @@
 from dataclasses import dataclass
 from functools import lru_cache
 from os import getenv
+from pathlib import Path
+
+
+_ENV_LOADED = False
+
+
+def _load_env_files() -> None:
+    global _ENV_LOADED
+    if _ENV_LOADED:
+        return
+
+    base_dir = Path(__file__).resolve().parents[2]  # backend/
+    candidates = [
+        base_dir / ".env",
+        base_dir / ".env.local",
+        base_dir / ".env.redpanda",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                from os import environ
+
+                # File-based env should be authoritative for this project runtime
+                # to avoid stale shell/session variables overriding latest config.
+                environ[key] = value
+
+    _ENV_LOADED = True
 
 
 def _split_csv_env(value: str | None) -> set[str]:
@@ -46,6 +82,7 @@ def _get_optional_str_env(name: str, default: str | None = None) -> str | None:
 
 @dataclass(frozen=True)
 class Settings:
+    auth_disable: bool
     auth_domain: str
     auth_audience: str
     auth_issuer: str
@@ -74,10 +111,13 @@ class Settings:
     circuit_breaker_failure_threshold: int
     circuit_breaker_reset_seconds: int
     dead_letter_dir: str
+    supabase_db_url: str | None
 
 
 @lru_cache
 def get_settings() -> Settings:
+    _load_env_files()
+
     auth0_domain = getenv("AUTH0_DOMAIN", "").strip()
     default_legacy_issuer = f"https://{auth0_domain}/" if auth0_domain else ""
 
@@ -95,6 +135,7 @@ def get_settings() -> Settings:
         auth_jwt_algorithms = ["RS256"]
 
     return Settings(
+        auth_disable=_get_bool_env("AUTH_DISABLE", False),
         auth_domain=auth_domain,
         auth_audience=auth_audience,
         auth_issuer=auth_issuer,
@@ -131,5 +172,6 @@ def get_settings() -> Settings:
             1, _get_int_env("CIRCUIT_BREAKER_RESET_SECONDS", 30)
         ),
         dead_letter_dir=getenv("DEAD_LETTER_DIR", "backend/dead_letter"),
+        supabase_db_url=_get_optional_str_env("SUPABASE_DB_URL", _get_optional_str_env("DATABASE_URL")),
     )
 

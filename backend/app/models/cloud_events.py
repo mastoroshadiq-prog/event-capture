@@ -95,17 +95,13 @@ class VehicleInspectedCloudEvent(CloudEventBase):
     data: VehicleInspectedEventData
 
 
-class GoodsReceivedItemData(BaseModel):
+class GoodsReceivedVerifiedData(BaseModel):
     product_id: str = Field(min_length=1, max_length=64)
     vin_number: str = Field(min_length=17, max_length=17)
     condition_notes: str = Field(min_length=1, max_length=500)
     landed_cost_actual: float = Field(ge=0)
-
-
-class GoodsReceivedVerifiedData(BaseModel):
     vendor_id: str = Field(min_length=1, max_length=64)
     operator_id: str = Field(min_length=1, max_length=64)
-    item_list: GoodsReceivedItemData
 
 
 class GoodsReceivedVerifiedCloudEvent(BaseModel):
@@ -120,4 +116,38 @@ class GoodsReceivedVerifiedCloudEvent(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     time: datetime
     data: GoodsReceivedVerifiedData
+
+
+class VehicleReceivingContext(BaseModel):
+    warehouse_id: str = Field(min_length=1, max_length=64)
+    inspector_id: str = Field(min_length=1, max_length=64)
+    delivery_purpose: str = Field(min_length=1, max_length=256)
+
+
+class VehicleReceivedItem(BaseModel):
+    vin: str = Field(min_length=17, max_length=17)
+    model: str = Field(min_length=1, max_length=128)
+    odometer: int = Field(ge=0)
+    condition: str = Field(min_length=1, max_length=32)
+    received_at: datetime
+
+
+class VehicleInventoryReceivedData(BaseModel):
+    receiving_context: VehicleReceivingContext
+    received_items: list[VehicleReceivedItem] = Field(min_length=1, max_length=500)
+
+
+class VehicleInventoryReceivedCloudEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    specversion: Literal["1.0"] = "1.0"
+    type: Literal["com.arista.vehicle.inventory.received.v1"] = (
+        "com.arista.vehicle.inventory.received.v1"
+    )
+    source: str = Field(min_length=1, max_length=255)
+    subject: str = Field(min_length=1, max_length=128)
+    id: str = Field(min_length=1, max_length=128)
+    time: datetime
+    datacontenttype: Literal["application/json"] = "application/json"
+    data: VehicleInventoryReceivedData
 

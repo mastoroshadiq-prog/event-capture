@@ -1,18 +1,22 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
+import 'receiving_state.dart';
+
 const _uuid = Uuid();
 
 const _defaultBaseUrl = 'http://10.0.2.2:8000';
-const _eventEndpoint = '/v1/events/vehicle-received';
+const _eventEndpoint = '/v1/events/vehicle-received/batch';
 const _cloudEventType = 'com.arista.inventory.goods_received.verified';
 
 // Pre-defined assignment context (sesuai permintaan)
@@ -57,6 +61,76 @@ class ApiResult {
   final String body;
 }
 
+class PendingScanItem {
+  PendingScanItem({
+    required this.id,
+    required this.rawScan,
+    required this.payload,
+    required this.idempotencyKey,
+    required this.correlationId,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String rawScan;
+  final Map<String, dynamic> payload;
+  final String idempotencyKey;
+  final String correlationId;
+  final String createdAt;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'rawScan': rawScan,
+    'payload': payload,
+    'idempotencyKey': idempotencyKey,
+    'correlationId': correlationId,
+    'createdAt': createdAt,
+  };
+
+  factory PendingScanItem.fromJson(Map<String, dynamic> json) =>
+      PendingScanItem(
+        id: json['id'] as String,
+        rawScan: json['rawScan'] as String,
+        payload: Map<String, dynamic>.from(json['payload'] as Map),
+        idempotencyKey: json['idempotencyKey'] as String,
+        correlationId: json['correlationId'] as String,
+        createdAt: json['createdAt'] as String,
+      );
+}
+
+class OfflineQueueStore {
+  const OfflineQueueStore();
+
+  static const _secure = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+  static const _queueKey = 'offline_scan_queue';
+
+  Future<List<PendingScanItem>> load() async {
+    final raw = await _secure.read(key: _queueKey);
+    if (raw == null || raw.isEmpty) {
+      return [];
+    }
+    try {
+      return (jsonDecode(raw) as List)
+          .map(
+            (item) => PendingScanItem.fromJson(
+              Map<String, dynamic>.from(item as Map),
+            ),
+          )
+          .toList();
+    } catch (_) {
+      await _secure.delete(key: _queueKey);
+      return [];
+    }
+  }
+
+  Future<void> save(List<PendingScanItem> queue) async {
+    final raw = jsonEncode(queue.map((item) => item.toJson()).toList());
+    await _secure.write(key: _queueKey, value: raw);
+  }
+}
+
 class GatewayClient {
   GatewayClient(this._client);
 
@@ -80,7 +154,7 @@ class GatewayClient {
           },
           body: jsonEncode(payload),
         )
-        .timeout(const Duration(seconds: 12));
+        .timeout(const Duration(seconds: 35));
 
     return ApiResult(
       ok: response.statusCode >= 200 && response.statusCode < 300,
@@ -499,7 +573,7 @@ class HomeMenuPage extends StatelessWidget {
               onTap: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(
-                    builder: (_) => ReceiveUnitPage(session: session),
+                    builder: (_) => ReceiveUnitPocPage(session: session),
                   ),
                 );
               },
@@ -540,6 +614,435 @@ class HomeMenuPage extends StatelessWidget {
   }
 }
 
+class ReceiveUnitPocPage extends StatelessWidget {
+  const ReceiveUnitPocPage({super.key, required this.session});
+
+  final AppSession session;
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (_) => ReceivingState(),
+      child: _ReceiveUnitPocView(session: session),
+    );
+  }
+}
+
+class _ReceiveUnitPocView extends StatefulWidget {
+  const _ReceiveUnitPocView({required this.session});
+
+  final AppSession session;
+
+  @override
+  State<_ReceiveUnitPocView> createState() => _ReceiveUnitPocViewState();
+}
+
+class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
+  final _client = GatewayClient(http.Client());
+  bool _busy = false;
+  String _status = 'Scan QR Surat Jalan (PO) untuk memulai.';
+  int _batchDone = 0;
+  int _batchTotal = 0;
+  final Map<String, String> _itemStatuses = {};
+
+  @override
+  void dispose() {
+    _client._client.close();
+    super.dispose();
+  }
+
+  Future<void> _scanPo() async {
+    final code = await Navigator.of(
+      context,
+    ).push<String>(MaterialPageRoute(builder: (_) => const ScanCodePage()));
+    if (code == null || code.trim().isEmpty || !mounted) return;
+
+    final state = context.read<ReceivingState>();
+    final ok = state.activatePo(code.trim());
+    setState(() {
+      _status = ok
+          ? 'PO aktif: ${state.activePo?.poNumber}. Lanjut scan VIN unit.'
+          : (state.lastError ?? 'PO tidak terdaftar');
+    });
+  }
+
+  Future<void> _scanVinAndVerify() async {
+    final state = context.read<ReceivingState>();
+    if (state.activePo == null) {
+      setState(() => _status = 'Scan PO dulu sebelum scan VIN.');
+      return;
+    }
+
+    final code = await Navigator.of(
+      context,
+    ).push<String>(MaterialPageRoute(builder: (_) => const ScanCodePage()));
+    if (code == null || code.trim().isEmpty || !mounted) return;
+
+    final vin = code.trim().toUpperCase();
+    if (state.isVinVerified(vin)) {
+      setState(() => _status = 'VIN sudah diverifikasi sebelumnya.');
+      return;
+    }
+
+    final formResult = await _showVerifyModal(vin);
+    if (formResult == null || !mounted) return;
+
+    final ok = state.verifyVin(
+      scannedVin: vin,
+      odometer: formResult.$1,
+      condition: formResult.$2,
+    );
+    setState(() {
+      _status = ok
+          ? 'VIN $vin berhasil diverifikasi.'
+          : (state.lastError ?? 'Gagal verifikasi VIN');
+    });
+  }
+
+  Future<(int, String)?> _showVerifyModal(String vin) async {
+    final odometerCtrl = TextEditingController();
+    String condition = 'Grade A';
+
+    return showDialog<(int, String)>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModal) {
+            return AlertDialog(
+              title: Text('Verifikasi VIN $vin'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: odometerCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Odometer'),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    initialValue: condition,
+                    items: const [
+                      DropdownMenuItem(
+                        value: 'Grade A',
+                        child: Text('Grade A'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'Grade B',
+                        child: Text('Grade B'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'Grade C',
+                        child: Text('Grade C'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setModal(() => condition = value);
+                    },
+                    decoration: const InputDecoration(
+                      labelText: 'Condition Score',
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Batal'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final odometer = int.tryParse(odometerCtrl.text.trim());
+                    if (odometer == null || odometer < 0) return;
+                    Navigator.of(context).pop((odometer, condition));
+                  },
+                  child: const Text('Simpan'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _submitBatch() async {
+    final state = context.read<ReceivingState>();
+    final payload = state.generateCloudEvent(
+      inspectorId: widget.session.operatorId,
+    );
+    if (payload == null) {
+      setState(() => _status = 'Minimal 1 unit harus diverifikasi.');
+      return;
+    }
+
+    final items =
+        (payload['data'] as Map<String, dynamic>)['received_items'] as List;
+    final vins = items
+        .map(
+          (item) => ((item as Map<String, dynamic>)['vin'] ?? '-').toString(),
+        )
+        .toList();
+
+    setState(() {
+      _batchTotal = vins.length;
+      _batchDone = 0;
+      _itemStatuses
+        ..clear()
+        ..addEntries(vins.map((vin) => MapEntry(vin, 'pending')));
+      _busy = true;
+      _status = 'Menyiapkan batch $_batchTotal unit...';
+    });
+
+    for (final vin in vins) {
+      if (!mounted) return;
+      await Future<void>.delayed(const Duration(milliseconds: 220));
+      setState(() {
+        _itemStatuses[vin] = 'processing';
+        _status = 'Memproses VIN $vin ($_batchDone/$_batchTotal)';
+      });
+    }
+
+    try {
+      final result = await _client.sendVehicleReceived(
+        session: widget.session,
+        payload: payload,
+        idempotencyKey: _uuid.v4(),
+        correlationId: _uuid.v4(),
+      );
+      if (!mounted) return;
+      setState(() {
+        if (result.ok) {
+          final body = _safeDecodeMap(result.body);
+          final rawStatuses = body['item_statuses'];
+          final itemStatuses = (rawStatuses is List ? rawStatuses : const [])
+              .whereType<Map>()
+              .map((e) => Map<String, dynamic>.from(e))
+              .toList();
+
+          _batchDone = 0;
+          _itemStatuses.clear();
+          for (final item in itemStatuses) {
+            final vin = _stringOf(item['vin']) ?? '-';
+            final status = _stringOf(item['status']) ?? 'pending';
+            _itemStatuses[vin] = switch (status) {
+              'published' => 'success',
+              'failed' => 'failed',
+              'processing' => 'processing',
+              _ => 'pending',
+            };
+            if (status == 'published') {
+              _batchDone++;
+            }
+          }
+          if (_itemStatuses.isEmpty) {
+            _batchDone = _batchTotal;
+            for (final vin in vins) {
+              _itemStatuses[vin] = 'success';
+            }
+          }
+          _status =
+              'Data batch berhasil disimpan & event dipublish ($_batchDone/$_batchTotal).';
+        } else {
+          final hasSuccess = _batchDone > 0;
+          for (final vin in _itemStatuses.keys) {
+            if (_itemStatuses[vin] != 'success') {
+              _itemStatuses[vin] = 'failed';
+            }
+          }
+          _status = hasSuccess
+              ? 'Batch parsial gagal (HTTP ${result.statusCode}): ${result.body}'
+              : 'Gagal batch (HTTP ${result.statusCode}): ${result.body}';
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        for (final vin in _itemStatuses.keys) {
+          if (_itemStatuses[vin] != 'success') {
+            _itemStatuses[vin] = 'failed';
+          }
+        }
+        _status = 'Gagal kirim batch: $e';
+      });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Widget _statusChip(String status) {
+    IconData icon;
+    Color color;
+    switch (status) {
+      case 'success':
+        icon = Icons.check_circle;
+        color = Colors.green;
+        break;
+      case 'failed':
+        icon = Icons.error;
+        color = Colors.red;
+        break;
+      case 'processing':
+        icon = Icons.sync;
+        color = Colors.blue;
+        break;
+      default:
+        icon = Icons.schedule;
+        color = Colors.orange;
+    }
+    return Chip(
+      avatar: Icon(icon, size: 14, color: color),
+      label: Text(status),
+      visualDensity: VisualDensity.compact,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<ReceivingState>();
+    final po = state.activePo;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('POC Penerimaan Unit')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Tahap 1: Scan PO'),
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: _busy ? null : _scanPo,
+                    icon: const Icon(Icons.qr_code_scanner),
+                    label: const Text('Scan QR Surat Jalan'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          if (po != null)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('PO: ${po.poNumber}'),
+                    Text('Vendor: ${po.vendorInfo}'),
+                    Text('Warehouse: ${po.warehouseId}'),
+                    Text(
+                      'Progress: ${state.verifiedCount}/${state.totalUnits} Unit',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          const SizedBox(height: 10),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Tahap 2: Verifikasi Unit'),
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: _busy ? null : _scanVinAndVerify,
+                    icon: const Icon(Icons.document_scanner),
+                    label: const Text('Scan VIN Fisik Unit'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          if (po != null)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Column(
+                  children: po.units
+                      .map(
+                        (u) => ListTile(
+                          leading: Icon(
+                            state.isVinVerified(u.vin)
+                                ? Icons.check_circle
+                                : Icons.radio_button_unchecked,
+                            color: state.isVinVerified(u.vin)
+                                ? Colors.green
+                                : Colors.grey,
+                          ),
+                          title: Text(u.vin),
+                          subtitle: Text(u.model),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+            ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _busy ? null : _submitBatch,
+              icon: _busy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.cloud_upload),
+              label: Text(
+                _busy ? 'Mengirim...' : 'Unit Diterima (Batch Publish)',
+              ),
+            ),
+          ),
+          if (_batchTotal > 0) ...[
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Progress Batch: $_batchDone/$_batchTotal'),
+                    const SizedBox(height: 8),
+                    LinearProgressIndicator(
+                      value: _batchTotal == 0 ? 0 : (_batchDone / _batchTotal),
+                    ),
+                    const SizedBox(height: 10),
+                    ..._itemStatuses.entries.map(
+                      (entry) => ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(entry.key),
+                        trailing: _statusChip(entry.value),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Card(
+            color: const Color(0xFFE8F5E9),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(_status),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class ReceiveUnitPage extends StatefulWidget {
   const ReceiveUnitPage({super.key, required this.session});
 
@@ -551,14 +1054,62 @@ class ReceiveUnitPage extends StatefulWidget {
 
 class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
   final _client = GatewayClient(http.Client());
+  final _queueStore = const OfflineQueueStore();
+  final _connectivity = Connectivity();
 
   bool _busy = false;
+  bool _syncing = false;
+  bool _online = false;
   String _status = 'Klik scan untuk membaca QRCode/Barcode event.';
   String _rawScan = '';
   Map<String, dynamic>? _payload;
+  List<MapEntry<String, String>> _scannedAttributes = [];
+  int _selectedTab = 0;
+  List<PendingScanItem> _queue = [];
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_bootstrap());
+  }
+
+  Future<void> _bootstrap() async {
+    _queue = await _queueStore.load();
+    final initial = await _connectivity.checkConnectivity();
+    _applyConnectivity(initial, autoSync: true);
+    _connectivitySub = _connectivity.onConnectivityChanged.listen((result) {
+      _applyConnectivity(result, autoSync: true);
+    });
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _applyConnectivity(
+    List<ConnectivityResult> result, {
+    required bool autoSync,
+  }) {
+    final connected = result.any((item) => item != ConnectivityResult.none);
+    final changed = connected != _online;
+    _online = connected;
+
+    if (mounted && changed) {
+      setState(() {
+        _status = connected
+            ? 'Internet tersedia. Sinkronisasi antrean berjalan di background.'
+            : 'Offline: hasil scan akan masuk ke antrean lokal.';
+      });
+    }
+
+    if (connected && autoSync) {
+      unawaited(_flushQueue(background: true));
+    }
+  }
 
   @override
   void dispose() {
+    _connectivitySub?.cancel();
     _client._client.close();
     super.dispose();
   }
@@ -575,12 +1126,176 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
       scanned: code.trim(),
       operatorId: widget.session.operatorId,
     );
+    final scannedAttributes = _extractScannedAttributes(code.trim());
 
     setState(() {
       _rawScan = code.trim();
       _payload = payload;
-      _status = 'Scan berhasil. Periksa preview lalu kirim event.';
+      _scannedAttributes = scannedAttributes;
+      _status = 'Scan berhasil. Periksa detail atribut lalu Submit.';
     });
+  }
+
+  List<MapEntry<String, String>> _extractScannedAttributes(String raw) {
+    final loosePairs = _extractLoosePairs(raw);
+    final root = _safeDecodeMap(raw);
+    final dataRoot = _asMap(root['data']);
+
+    final purchaseOrder = _firstNonEmptyString([
+      _looseGet(loosePairs, const [
+        'purchase_order',
+        'purchaseOrder',
+        'subject',
+        'po_number',
+        'purchase order',
+      ]),
+      _lookupAnyString(root, const [
+        'purchase_order',
+        'purchaseOrder',
+        'subject',
+        'po_number',
+      ]),
+      _lookupAnyString(dataRoot, const ['purchase_order', 'purchaseOrder']),
+      _extractFieldFromRaw(raw, const [
+        'purchase_order',
+        'purchaseOrder',
+        'subject',
+        'po_number',
+      ]),
+    ]);
+    final vendorId = _firstNonEmptyString([
+      _looseGet(loosePairs, const [
+        'vendor_id',
+        'vendorId',
+        'vendor',
+        'vendor id',
+      ]),
+      _lookupAnyString(root, const ['vendor_id', 'vendorId', 'vendor']),
+      _lookupAnyString(dataRoot, const ['vendor_id', 'vendorId', 'vendor']),
+      _extractFieldFromRaw(raw, const ['vendor_id', 'vendorId', 'vendor']),
+    ]);
+    final operatorId = _firstNonEmptyString([
+      _looseGet(loosePairs, const ['operator_id', 'operatorId', 'operator id']),
+      _lookupAnyString(root, const ['operator_id', 'operatorId']),
+      _lookupAnyString(dataRoot, const ['operator_id', 'operatorId']),
+      _extractFieldFromRaw(raw, const ['operator_id', 'operatorId']),
+    ]);
+    final productId = _firstNonEmptyString([
+      _looseGet(loosePairs, const [
+        'product_id',
+        'productId',
+        'model_code',
+        'sku',
+        'product id',
+      ]),
+      _lookupAnyString(root, const [
+        'product_id',
+        'productId',
+        'model_code',
+        'sku',
+      ]),
+      _lookupAnyString(dataRoot, const [
+        'product_id',
+        'productId',
+        'model_code',
+        'sku',
+      ]),
+      _extractFieldFromRaw(raw, const [
+        'product_id',
+        'productId',
+        'model_code',
+        'sku',
+      ]),
+    ]);
+    final vinNumber = _firstNonEmptyString([
+      _looseGet(loosePairs, const [
+        'vin_number',
+        'vinNumber',
+        'vin',
+        'vin number',
+      ]),
+      _lookupAnyString(root, const ['vin_number', 'vinNumber', 'vin']),
+      _lookupAnyString(dataRoot, const ['vin_number', 'vinNumber', 'vin']),
+      _extractFieldFromRaw(raw, const ['vin_number', 'vinNumber', 'vin']),
+      _extractVinFallback(raw),
+    ]);
+    final conditionNotes = _firstNonEmptyString([
+      _stringOf(loosePairs['condition_notes']),
+      _stringOf(loosePairs['conditionNotes']),
+      _stringOf(loosePairs['condition']),
+      _lookupAnyString(root, const [
+        'condition_notes',
+        'conditionNotes',
+        'condition',
+      ]),
+      _lookupAnyString(dataRoot, const [
+        'condition_notes',
+        'conditionNotes',
+        'condition',
+      ]),
+      _extractFieldFromRaw(raw, const [
+        'condition_notes',
+        'conditionNotes',
+        'condition',
+      ]),
+    ]);
+    final landedCost = _firstNonEmptyString([
+      _stringOf(
+        _numOf(
+              _looseGet(loosePairs, const [
+                'landed_cost_actual',
+                'landedCostActual',
+                'landed_cost',
+                'landed cost actual',
+              ]),
+            ) ??
+            _numOf(loosePairs['landed_cost_actual']) ??
+            _numOf(loosePairs['landedCostActual']) ??
+            _numOf(loosePairs['landed_cost']),
+      ),
+      _stringOf(
+        _lookupAnyNum(root, const [
+          'landed_cost_actual',
+          'landedCostActual',
+          'landed_cost',
+        ]),
+      ),
+      _stringOf(
+        _lookupAnyNum(dataRoot, const [
+          'landed_cost_actual',
+          'landedCostActual',
+          'landed_cost',
+        ]),
+      ),
+      _stringOf(
+        _extractFieldFromRawNumber(raw, const [
+          'landed_cost_actual',
+          'landedCostActual',
+          'landed_cost',
+        ]),
+      ),
+      _extractFieldFromRaw(raw, const [
+        'landed_cost_actual',
+        'landedCostActual',
+        'landed_cost',
+      ]),
+    ]);
+
+    final entries = <MapEntry<String, String>>[];
+    void addIf(String label, String? value) {
+      if (value != null && value.trim().isNotEmpty) {
+        entries.add(MapEntry(label, value.trim()));
+      }
+    }
+
+    addIf('Purchase Order', purchaseOrder);
+    addIf('Vendor ID', vendorId);
+    addIf('Operator ID', operatorId);
+    addIf('Product ID', productId);
+    addIf('VIN Number', vinNumber);
+    addIf('Condition Notes', conditionNotes);
+    addIf('Landed Cost Actual', landedCost);
+    return entries;
   }
 
   Map<String, dynamic> _buildPayloadFromScan({
@@ -590,28 +1305,23 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
     final nowUtc = DateTime.now().toUtc().toIso8601String();
     final root = _safeDecodeMap(scanned);
     final dataRoot = _asMap(root['data']);
-    final itemValue = dataRoot['item_list'];
-    final itemRoot = itemValue is List && itemValue.isNotEmpty
-        ? _asMap(itemValue.first)
-        : _asMap(itemValue);
 
     final vinNumber =
         _firstNonEmptyString([
-          _lookupAnyString(itemRoot, const ['vin_number', 'vinNumber', 'vin']),
           _lookupAnyString(dataRoot, const ['vin_number', 'vinNumber', 'vin']),
           _lookupAnyString(root, const ['vin_number', 'vinNumber', 'vin']),
+          _findAnyStringDeep(root, const ['vin_number', 'vinNumber', 'vin']),
+          _extractFieldFromRaw(scanned, const [
+            'vin_number',
+            'vinNumber',
+            'vin',
+          ]),
           _extractVinFallback(scanned),
         ]) ??
         '';
 
     final productId =
         _firstNonEmptyString([
-          _lookupAnyString(itemRoot, const [
-            'product_id',
-            'productId',
-            'model_code',
-            'sku',
-          ]),
           _lookupAnyString(dataRoot, const [
             'product_id',
             'productId',
@@ -624,21 +1334,33 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
             'model_code',
             'sku',
           ]),
+          _findAnyStringDeep(root, const [
+            'product_id',
+            'productId',
+            'model_code',
+            'sku',
+          ]),
+          _extractFieldFromRaw(scanned, const [
+            'product_id',
+            'productId',
+            'model_code',
+            'sku',
+          ]),
         ]) ??
-        'UNKNOWN';
+        '-';
 
     final landedCostRaw =
-        _lookupAnyNum(itemRoot, const [
-          'landed_cost_actual',
-          'landedCostActual',
-          'landed_cost',
-        ]) ??
         _lookupAnyNum(dataRoot, const [
           'landed_cost_actual',
           'landedCostActual',
           'landed_cost',
         ]) ??
         _lookupAnyNum(root, const [
+          'landed_cost_actual',
+          'landedCostActual',
+          'landed_cost',
+        ]) ??
+        _extractFieldFromRawNumber(scanned, const [
           'landed_cost_actual',
           'landedCostActual',
           'landed_cost',
@@ -653,6 +1375,11 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
           _stringOf(root['subject']) ??
           _stringOf(root['po_number']) ??
           _stringOf(root['po_id']) ??
+          _extractFieldFromRaw(scanned, const [
+            'subject',
+            'po_number',
+            'po_id',
+          ]) ??
           'PO-UNKNOWN',
       'id': _stringOf(root['id']) ?? _uuid.v4(),
       'time': _stringOf(root['time']) ?? nowUtc,
@@ -665,23 +1392,44 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
                 'vendor',
               ]),
               _lookupAnyString(root, const ['vendor_id', 'vendorId', 'vendor']),
+              _findAnyStringDeep(root, const [
+                'vendor_id',
+                'vendorId',
+                'vendor',
+              ]),
+              _extractFieldFromRaw(scanned, const [
+                'vendor_id',
+                'vendorId',
+                'vendor',
+              ]),
             ]) ??
-            'UNKNOWN',
+            '-',
         'operator_id': operatorId,
-        'item_list': {
-          'product_id': productId,
-          'vin_number': vinNumber,
-          'condition_notes':
-              _stringOf(itemRoot['condition_notes']) ??
-              _stringOf(root['condition_notes']) ??
-              'Good - No Scratch',
-          'landed_cost_actual': landedCostActual,
-        },
+        'product_id': productId,
+        'vin_number': vinNumber,
+        'condition_notes':
+            _firstNonEmptyString([
+              _lookupAnyString(dataRoot, const [
+                'condition_notes',
+                'conditionNotes',
+              ]),
+              _lookupAnyString(root, const [
+                'condition_notes',
+                'conditionNotes',
+              ]),
+              _extractFieldFromRaw(scanned, const [
+                'condition_notes',
+                'conditionNotes',
+                'condition',
+              ]),
+            ]) ??
+            'Good - No Scratch',
+        'landed_cost_actual': landedCostActual,
       },
     };
   }
 
-  Future<void> _send() async {
+  Future<void> _submit() async {
     final payload = _payload;
     if (payload == null) {
       setState(() => _status = 'Belum ada hasil scan.');
@@ -689,14 +1437,12 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
     }
 
     final data = _asMap(payload['data']);
-    final item = _asMap(data['item_list']);
-    final vin = _stringOf(item['vin_number']) ?? '';
+    final vin = _stringOf(data['vin_number']) ?? '';
     final subject = _stringOf(payload['subject']) ?? '';
 
     if (vin.length != 17) {
       setState(
-        () => _status =
-            'Payload invalid: data.item_list.vin_number harus 17 karakter.',
+        () => _status = 'Payload invalid: data.vin_number harus 17 karakter.',
       );
       return;
     }
@@ -708,24 +1454,49 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
       return;
     }
 
+    final idempotencyKey = _uuid.v4();
+    final correlationId = _uuid.v4();
+
+    if (!_online) {
+      final queue = await _queueStore.load();
+      queue.add(
+        PendingScanItem(
+          id: _uuid.v4(),
+          rawScan: _rawScan,
+          payload: payload,
+          idempotencyKey: idempotencyKey,
+          correlationId: correlationId,
+          createdAt: DateTime.now().toUtc().toIso8601String(),
+        ),
+      );
+      await _queueStore.save(queue);
+      if (!mounted) return;
+      setState(() {
+        _queue = queue;
+        _selectedTab = 1;
+        _status = 'Offline: scan disimpan ke antrean (${queue.length} item).';
+      });
+      return;
+    }
+
     setState(() => _busy = true);
     try {
       final result = await _client.sendVehicleReceived(
         session: widget.session,
         payload: payload,
-        idempotencyKey: _uuid.v4(),
-        correlationId: _uuid.v4(),
+        idempotencyKey: idempotencyKey,
+        correlationId: correlationId,
       );
 
       if (!mounted) return;
       setState(() {
         _status = result.ok
-            ? 'ACK ${result.statusCode}: ${result.body}'
-            : 'NACK ${result.statusCode}: ${result.body}';
+            ? 'Data scan berhasil disimpan. Event dipublish di background.'
+            : 'Gagal menyimpan data scan (HTTP ${result.statusCode}): ${result.body}';
       });
     } catch (error) {
       if (!mounted) return;
-      setState(() => _status = 'Gagal kirim event: $error');
+      setState(() => _status = 'Gagal menyimpan data scan: $error');
     } finally {
       if (mounted) {
         setState(() => _busy = false);
@@ -733,111 +1504,288 @@ class _ReceiveUnitPageState extends State<ReceiveUnitPage> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(title: const Text('Penerimaan Unit - Scan')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+  Future<void> _flushQueue({required bool background}) async {
+    if (_syncing || !_online) {
+      return;
+    }
+    _syncing = true;
+    final queue = await _queueStore.load();
+    if (queue.isEmpty) {
+      _syncing = false;
+      if (mounted && !background) {
+        setState(() => _status = 'Antrean offline kosong.');
+      }
+      return;
+    }
+
+    final remaining = <PendingScanItem>[];
+    var success = 0;
+
+    for (final item in queue) {
+      try {
+        final result = await _client.sendVehicleReceived(
+          session: widget.session,
+          payload: item.payload,
+          idempotencyKey: item.idempotencyKey,
+          correlationId: item.correlationId,
+        );
+        if (result.ok) {
+          success++;
+        } else {
+          remaining.add(item);
+        }
+      } catch (_) {
+        remaining.add(item);
+      }
+    }
+
+    await _queueStore.save(remaining);
+    _syncing = false;
+    if (!mounted) return;
+    setState(() {
+      _queue = remaining;
+      _status =
+          'Sinkronisasi antrean: sukses $success, tersisa ${remaining.length}.';
+    });
+  }
+
+  List<MapEntry<String, String>> _payloadPairs(Map<String, dynamic> payload) {
+    final data = _asMap(payload['data']);
+    final eventType = _stringOf(payload['type']) ?? '-';
+    final source = _stringOf(payload['source']) ?? '-';
+    final subject = _stringOf(payload['subject']) ?? '-';
+    final eventTime = _stringOf(payload['time']) ?? '-';
+    final operatorId = _stringOf(data['operator_id']) ?? '-';
+    final vendorId = _stringOf(data['vendor_id']) ?? '-';
+    final productId = _stringOf(data['product_id']) ?? '-';
+    final vinNumber = _stringOf(data['vin_number']) ?? '-';
+    final conditionNotes = _stringOf(data['condition_notes']) ?? '-';
+    final landedCost = _stringOf(data['landed_cost_actual']) ?? '-';
+
+    return [
+      MapEntry('Operator ID', operatorId),
+      MapEntry('Vendor ID', vendorId),
+      MapEntry('Product ID', productId),
+      MapEntry('VIN Number', vinNumber),
+      MapEntry('Source', source),
+      MapEntry('Event Time', eventTime),
+      MapEntry('Subject/PO', subject),
+      MapEntry('Event Type', eventType),
+      MapEntry('Condition Notes', conditionNotes),
+      MapEntry('Landed Cost Actual', landedCost),
+    ];
+  }
+
+  Widget _scanTab(ThemeData theme) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Context aktif', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 6),
+                  Text('WHO: ${widget.session.operatorId}'),
+                  const Text('Task: Penerimaan Unit'),
+                  const Text('Location: Gudang Arista Kalimalang'),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _busy ? null : _scan,
+              icon: const Icon(Icons.qr_code_scanner),
+              label: const Text('Scan QRCode / Barcode'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (_payload != null)
             Card(
               child: Padding(
-                padding: const EdgeInsets.all(14),
+                padding: const EdgeInsets.all(12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Context aktif', style: theme.textTheme.titleMedium),
-                    const SizedBox(height: 6),
-                    Text('WHO: ${widget.session.operatorId}'),
-                    const Text('Task: Penerimaan Unit'),
-                    const Text('Location: Gudang Arista Kalimalang'),
+                    Text(
+                      'Detail Hasil Scan',
+                      style: theme.textTheme.titleSmall,
+                    ),
+                    const SizedBox(height: 8),
+                    ...((_rawScan.isNotEmpty
+                                    ? _scannedAttributes
+                                    : _payloadPairs(_payload!))
+                                .isNotEmpty
+                            ? (_rawScan.isNotEmpty
+                                  ? _scannedAttributes
+                                  : _payloadPairs(_payload!))
+                            : [
+                                const MapEntry(
+                                  'Info',
+                                  'Atribut QR belum terbaca',
+                                ),
+                              ])
+                        .map(
+                          (pair) => Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 5),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  flex: 5,
+                                  child: Text(
+                                    pair.key,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(flex: 7, child: Text(pair.value)),
+                              ],
+                            ),
+                          ),
+                        ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: _busy ? null : _submit,
+                        icon: const Icon(Icons.check_circle),
+                        label: Text(_busy ? 'Menyimpan...' : 'Simpan Data'),
+                      ),
+                    ),
                   ],
                 ),
               ),
             ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _busy ? null : _scan,
-                    icon: const Icon(Icons.qr_code_scanner),
-                    label: const Text('Scan QRCode / Barcode'),
-                  ),
-                ),
-              ],
+          const SizedBox(height: 12),
+          Card(
+            color: _online ? const Color(0xFFE8F5E9) : const Color(0xFFFFF3E0),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(_status),
             ),
-            const SizedBox(height: 12),
-            if (_rawScan.isNotEmpty)
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Raw Scan', style: theme.textTheme.titleSmall),
-                      const SizedBox(height: 6),
-                      SelectableText(_rawScan),
-                    ],
-                  ),
-                ),
-              ),
-            if (_payload != null) ...[
-              const SizedBox(height: 10),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Preview Payload (vehicle.received)',
-                        style: theme.textTheme.titleSmall,
-                      ),
-                      const SizedBox(height: 6),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFF8FAFC),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: const Color(0xFFE2E8F0)),
-                        ),
-                        child: SelectableText(
-                          const JsonEncoder.withIndent('  ').convert(_payload),
-                          style: const TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: FilledButton.icon(
-                          onPressed: _busy ? null : _send,
-                          icon: const Icon(Icons.send),
-                          label: Text(_busy ? 'Mengirim...' : 'Kirim Event'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _queueTab(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('Antrean Offline', style: theme.textTheme.titleMedium),
+              const Spacer(),
+              OutlinedButton.icon(
+                onPressed: (_online && !_syncing)
+                    ? () => _flushQueue(background: false)
+                    : null,
+                icon: _syncing
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.sync),
+                label: const Text('Sync'),
               ),
             ],
-            const SizedBox(height: 12),
-            Card(
-              color: const Color(0xFFEEF2FF),
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Text(_status),
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: _queue.isEmpty
+                ? const Center(child: Text('Belum ada antrean offline.'))
+                : ListView.separated(
+                    itemCount: _queue.length,
+                    separatorBuilder: (context, index) =>
+                        const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final item = _queue[index];
+                      final data = _asMap(item.payload['data']);
+                      return Card(
+                        child: ListTile(
+                          title: Text(
+                            'VIN: ${_stringOf(data['vin_number']) ?? '-'}',
+                          ),
+                          subtitle: Text(
+                            'Product: ${_stringOf(data['product_id']) ?? '-'}\nCreated: ${item.createdAt}',
+                          ),
+                          isThreeLine: true,
+                          trailing: const Icon(Icons.schedule),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Penerimaan Unit'),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 14),
+            child: Center(
+              child: Chip(
+                avatar: Icon(
+                  _online ? Icons.cloud_done : Icons.cloud_off,
+                  size: 16,
+                  color: _online ? Colors.green : Colors.orange,
+                ),
+                label: Text('Queue: ${_queue.length}'),
               ),
             ),
-          ],
-        ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: SegmentedButton<int>(
+              segments: const [
+                ButtonSegment(
+                  value: 0,
+                  icon: Icon(Icons.qr_code_scanner),
+                  label: Text('Scan'),
+                ),
+                ButtonSegment(
+                  value: 1,
+                  icon: Icon(Icons.storage),
+                  label: Text('Offline Queue'),
+                ),
+              ],
+              selected: {_selectedTab},
+              onSelectionChanged: (value) {
+                setState(() => _selectedTab = value.first);
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: _selectedTab == 0 ? _scanTab(theme) : _queueTab(theme),
+          ),
+        ],
       ),
     );
   }
@@ -954,20 +1902,60 @@ class _ScanCodePageState extends State<ScanCodePage>
 }
 
 Map<String, dynamic> _safeDecodeMap(String raw) {
-  try {
-    final decoded = jsonDecode(raw);
-    if (decoded is Map) {
-      return Map<String, dynamic>.from(decoded);
+  final normalized = raw.trim();
+  final candidates = <String>{
+    normalized,
+    normalized.replaceAll(r'\"', '"'),
+    normalized.replaceAll(r'\n', '\n'),
+  };
+
+  for (final candidate in candidates) {
+    try {
+      final decoded = jsonDecode(candidate);
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {
+      // no-op
     }
-  } catch (_) {
-    // no-op
+
+    try {
+      final decodedUri = Uri.decodeComponent(candidate);
+      final decoded = jsonDecode(decodedUri);
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {
+      // no-op
+    }
+
+    final firstBrace = candidate.indexOf('{');
+    final lastBrace = candidate.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      final slice = candidate.substring(firstBrace, lastBrace + 1);
+      try {
+        final decoded = jsonDecode(slice);
+        if (decoded is Map) {
+          return Map<String, dynamic>.from(decoded);
+        }
+      } catch (_) {
+        // no-op
+      }
+    }
   }
+
   return <String, dynamic>{};
 }
 
 Map<String, dynamic> _asMap(dynamic value) {
   if (value is Map) {
     return Map<String, dynamic>.from(value);
+  }
+  if (value is String) {
+    final maybeMap = _safeDecodeMap(value);
+    if (maybeMap.isNotEmpty) {
+      return maybeMap;
+    }
   }
   return <String, dynamic>{};
 }
@@ -986,10 +1974,137 @@ String? _extractVinFallback(String raw) {
   return null;
 }
 
+String? _extractFieldFromRaw(String raw, List<String> aliases) {
+  final candidates = <String>{
+    raw,
+    raw.replaceAll(r'\"', '"'),
+    raw.replaceAll(r'\n', '\n'),
+  };
+
+  for (final alias in aliases) {
+    final escaped = RegExp.escape(alias);
+
+    for (final source in candidates) {
+      final jsonQuoted = RegExp(
+        '"?$escaped"?\\s*:\\s*"([^"\\n\\r]+)"',
+        caseSensitive: false,
+      );
+      final mQuoted = jsonQuoted.firstMatch(source);
+      if (mQuoted != null) {
+        final value = mQuoted.group(1)?.trim();
+        if (value != null && value.isNotEmpty) return value;
+      }
+
+      final jsonRaw = RegExp(
+        '"?$escaped"?\\s*:\\s*([^,}\\n\\r]+)',
+        caseSensitive: false,
+      );
+      final mRaw = jsonRaw.firstMatch(source);
+      if (mRaw != null) {
+        final cleaned = mRaw.group(1)?.replaceAll('"', '').trim();
+        if (cleaned != null && cleaned.isNotEmpty) return cleaned;
+      }
+
+      final queryPattern = RegExp(
+        '(^|[?&;,])$escaped=([^&;,\\s]+)',
+        caseSensitive: false,
+      );
+      final mQuery = queryPattern.firstMatch(source);
+      if (mQuery != null) {
+        final value = Uri.decodeComponent((mQuery.group(2) ?? '').trim());
+        if (value.isNotEmpty) return value;
+      }
+    }
+  }
+  return null;
+}
+
+Map<String, String> _extractLoosePairs(String raw) {
+  final result = <String, String>{};
+  final normalized = raw
+      .replaceAll(r'\n', '\n')
+      .replaceAll(r'\"', '"')
+      .replaceAll('\\"', '"');
+
+  final segments = normalized.split(RegExp(r'[\n;]+'));
+  for (final segment in segments) {
+    final text = segment.trim();
+    if (text.isEmpty) continue;
+    final separatorIndex = text.contains(':')
+        ? text.indexOf(':')
+        : text.indexOf('=');
+    if (separatorIndex <= 0) continue;
+    var key = text.substring(0, separatorIndex).trim();
+    var value = text.substring(separatorIndex + 1).trim();
+
+    key = key.replaceAll('"', '').trim();
+    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+      value = value.substring(1, value.length - 1).trim();
+    }
+    if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
+      value = value.substring(1, value.length - 1).trim();
+    }
+    if (value.endsWith(',')) {
+      value = value.substring(0, value.length - 1).trim();
+    }
+    if (key.isNotEmpty && value.isNotEmpty) {
+      result[key] = value;
+    }
+  }
+
+  final pattern = RegExp(
+    r'"?([a-zA-Z0-9_\-]+)"?\s*[:=]\s*"?([^"\n\r,}]+)"?',
+    multiLine: true,
+  );
+
+  for (final m in pattern.allMatches(normalized)) {
+    final key = (m.group(1) ?? '').trim();
+    final value = (m.group(2) ?? '').trim();
+    if (key.isEmpty || value.isEmpty) continue;
+    result[key] = value;
+  }
+  return result;
+}
+
+String? _looseGet(Map<String, String> pairs, List<String> aliases) {
+  for (final alias in aliases) {
+    final direct = pairs[alias];
+    if (direct != null && direct.trim().isNotEmpty) {
+      return direct.trim();
+    }
+
+    final target = _canonicalKey(alias);
+    for (final entry in pairs.entries) {
+      if (_canonicalKey(entry.key) == target && entry.value.trim().isNotEmpty) {
+        return entry.value.trim();
+      }
+    }
+  }
+  return null;
+}
+
+String _canonicalKey(String key) {
+  return key.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+}
+
+num? _extractFieldFromRawNumber(String raw, List<String> aliases) {
+  final value = _extractFieldFromRaw(raw, aliases);
+  if (value == null) return null;
+  return _numOf(value);
+}
+
 num? _numOf(dynamic value) {
   if (value is num) return value;
   if (value is String) {
-    return num.tryParse(value.trim());
+    final raw = value.trim();
+    final direct = num.tryParse(raw);
+    if (direct != null) return direct;
+
+    final cleaned = raw.replaceAll(RegExp(r'[^0-9,.-]'), '');
+    final normalized = cleaned.contains(',') && !cleaned.contains('.')
+        ? cleaned.replaceAll(',', '.')
+        : cleaned.replaceAll(',', '');
+    return num.tryParse(normalized);
   }
   return null;
 }
@@ -1014,6 +2129,33 @@ String? _firstNonEmptyString(List<String?> candidates) {
   for (final value in candidates) {
     if (value != null && value.trim().isNotEmpty) {
       return value.trim();
+    }
+  }
+  return null;
+}
+
+String? _findAnyStringDeep(dynamic node, List<String> aliases) {
+  if (node is Map) {
+    final map = Map<String, dynamic>.from(node);
+    for (final alias in aliases) {
+      final direct = _stringOf(map[alias]);
+      if (direct != null) return direct;
+      final lowerKey = map.keys
+          .where((k) => k.toLowerCase() == alias.toLowerCase())
+          .toList();
+      if (lowerKey.isNotEmpty) {
+        final value = _stringOf(map[lowerKey.first]);
+        if (value != null) return value;
+      }
+    }
+    for (final value in map.values) {
+      final nested = _findAnyStringDeep(value, aliases);
+      if (nested != null) return nested;
+    }
+  } else if (node is List) {
+    for (final item in node) {
+      final nested = _findAnyStringDeep(item, aliases);
+      if (nested != null) return nested;
     }
   }
   return null;

@@ -41,6 +41,7 @@ dependencies:
   connectivity_plus: ^6.1.5
   flutter_secure_storage: ^9.2.4
   supabase_flutter: ^2.10.3
+  provider: ^6.1.5
 
 dev_dependencies:
   flutter_test:

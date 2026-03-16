@@ -146,13 +146,22 @@ def _decode_jwt(token: str) -> dict:
 def get_auth_context(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> AuthContext:
+    settings = get_settings()
+    if settings.auth_disable:
+        return AuthContext(
+            subject="auth-disabled",
+            operator_id="auth-disabled",
+            device_id=None,
+            scopes=set(),
+            roles=set(),
+        )
+
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing bearer token",
         )
 
-    settings = get_settings()
     if settings.auth_verify_audience and not settings.auth_audience:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -218,6 +227,9 @@ def enforce_ingest_authorization(
     payload_device_id: str,
 ) -> None:
     settings = get_settings()
+
+    if settings.auth_disable:
+        return
 
     supervisor_role = settings.auth_supervisor_role
     is_supervisor = supervisor_role in auth_context.roles

@@ -2,7 +2,9 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.models.cloud_events import (
+    GoodsReceivedVerifiedData,
     GoodsReceivedVerifiedCloudEvent,
+    VehicleInventoryReceivedCloudEvent,
     VehicleInspectedCloudEvent,
     VehicleInspectedEventData,
     VehicleReceivedCloudEvent,
@@ -10,6 +12,8 @@ from app.models.cloud_events import (
 )
 from app.models.ingest import (
     GoodsReceivedVerifiedIngestRequest,
+    GoodsReceivedVerifiedRawIngestRequest,
+    VehicleInventoryReceivedIngestRequest,
     VehicleInspectedIngestRequest,
     VehicleReceivedIngestRequest,
 )
@@ -113,6 +117,50 @@ def build_goods_received_verified_cloudevent(
         subject=payload.subject,
         id=event_id,
         time=payload.time,
+        data=payload.data,
+    )
+
+
+def build_goods_received_verified_cloudevent_from_raw(
+    payload: GoodsReceivedVerifiedRawIngestRequest,
+    idempotency_key: str | None,
+) -> GoodsReceivedVerifiedCloudEvent:
+    event_id = _resolve_event_id(idempotency_key)
+
+    data = GoodsReceivedVerifiedData(
+        vendor_id=payload.vendor_name,
+        operator_id=payload.inspector_id,
+        product_id=payload.model_code,
+        vin_number=payload.chassis_number,
+        condition_notes=payload.condition_notes,
+        landed_cost_actual=payload.landed_cost_actual,
+    )
+
+    return GoodsReceivedVerifiedCloudEvent(
+        specversion="1.0",
+        type=payload.event_type,
+        source=payload.source,
+        subject=payload.purchase_order_ref,
+        id=event_id,
+        time=payload.arrival_time,
+        data=data,
+    )
+
+
+def build_vehicle_inventory_received_cloudevent(
+    payload: VehicleInventoryReceivedIngestRequest,
+    idempotency_key: str | None,
+) -> VehicleInventoryReceivedCloudEvent:
+    event_id = _resolve_event_id(idempotency_key)
+
+    return VehicleInventoryReceivedCloudEvent(
+        specversion=payload.specversion,
+        type=payload.type,
+        source=payload.source,
+        subject=payload.subject,
+        id=event_id,
+        time=payload.time,
+        datacontenttype=payload.datacontenttype,
         data=payload.data,
     )
 
