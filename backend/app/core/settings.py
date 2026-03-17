@@ -112,6 +112,7 @@ class Settings:
     circuit_breaker_reset_seconds: int
     dead_letter_dir: str
     supabase_db_url: str | None
+    event_first_mode: bool
 
 
 @lru_cache
@@ -173,5 +174,6 @@ def get_settings() -> Settings:
         ),
         dead_letter_dir=getenv("DEAD_LETTER_DIR", "backend/dead_letter"),
         supabase_db_url=_get_optional_str_env("SUPABASE_DB_URL", _get_optional_str_env("DATABASE_URL")),
+        event_first_mode=_get_bool_env("EVENT_FIRST_MODE", False),
     )
 

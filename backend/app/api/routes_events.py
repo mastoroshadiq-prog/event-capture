@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, status
+from fastapi import HTTPException
 
+from app.core.settings import get_settings
 from app.models.cloud_events import (
     GoodsReceivedVerifiedCloudEvent,
     VehicleInspectedCloudEvent,
@@ -28,6 +30,8 @@ from app.services.event_factory import (
 from app.services.dead_letter import get_dead_letter_service
 from app.services.idempotency import build_payload_hash, get_idempotency_store
 from app.services.redpanda_publisher import EventPublishError, get_redpanda_publisher
+from psycopg import connect
+from psycopg import Error as PsycopgError
 from app.services.scan_storage import (
     ScanItemStorageResult,
     ScanStorageError,
@@ -48,6 +52,58 @@ from app.security.auth import (
 router = APIRouter(prefix="/v1/events", tags=["events"])
 
 
+@router.get("/po/{po_number}", status_code=status.HTTP_200_OK)
+async def get_po_reference(po_number: str) -> dict:
+    settings = get_settings()
+    if not settings.supabase_db_url:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URL is not configured")
+
+    query = """
+        select
+          p.po_number,
+          p.vendor_info,
+          p.carrier_name,
+          p.description,
+          p.warehouse_id,
+          p.destination_branch,
+          i.vin,
+          i.model,
+          i.color
+        from public.po_master p
+        left join public.po_master_items i on i.po_id = p.id
+        where p.po_number = %(po_number)s and p.status = 'active'
+        order by i.vin asc
+    """
+
+    try:
+        with connect(settings.supabase_db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, {"po_number": po_number})
+                rows = cur.fetchall()
+    except PsycopgError as error:
+        raise HTTPException(status_code=500, detail=f"PO lookup failed: {error}") from error
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="PO not found")
+
+    first = rows[0]
+    units = [
+        {"vin": r[6], "model": r[7], "color": r[8]}
+        for r in rows
+        if r[6] is not None
+    ]
+
+    return {
+        "po_number": first[0],
+        "vendor_info": first[1],
+        "carrier_name": first[2],
+        "description": first[3],
+        "warehouse_id": first[4],
+        "destination_branch": first[5],
+        "units": units,
+    }
+
+
 @router.post(
     "/vehicle-received/batch",
     response_model=BatchIngestAcceptedResponse,
@@ -59,6 +115,9 @@ async def ingest_vehicle_received_batch(
     x_idempotency_key: str | None = Header(default=None),
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> BatchIngestAcceptedResponse:
+    settings = get_settings()
+    event_first_mode = settings.event_first_mode
+
     idempotency_key = x_idempotency_key.strip() if x_idempotency_key else None
     correlation_id = x_correlation_id.strip() if x_correlation_id else None
 
@@ -97,23 +156,26 @@ async def ingest_vehicle_received_batch(
     )
     correlation_value = correlation_id or cloud_event.id
 
-    try:
-        storage_result = save_vehicle_inventory_received_scan(
-            cloud_event=cloud_event,
-            correlation_id=correlation_value,
-            idempotency_key=idempotency_key,
-        )
-        item_storage_results = save_vehicle_inventory_received_items(
-            scan_id=storage_result.record_id,
-            cloud_event=cloud_event,
-        )
-    except ScanStorageError as error:
-        from fastapi import HTTPException
+    storage_result = None
+    item_storage_results: list[ScanItemStorageResult] = []
+    if not event_first_mode:
+        try:
+            storage_result = save_vehicle_inventory_received_scan(
+                cloud_event=cloud_event,
+                correlation_id=correlation_value,
+                idempotency_key=idempotency_key,
+            )
+            item_storage_results = save_vehicle_inventory_received_items(
+                scan_id=storage_result.record_id,
+                cloud_event=cloud_event,
+            )
+        except ScanStorageError as error:
+            from fastapi import HTTPException
 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to persist scan data: {error}",
-        ) from error
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to persist scan data: {error}",
+            ) from error
 
     publisher = get_redpanda_publisher()
     dead_letter_service = get_dead_letter_service()
@@ -139,8 +201,6 @@ async def ingest_vehicle_received_batch(
         )
 
         storage_item = item_by_vin.get(item.vin)
-        if storage_item is None:
-            continue
 
         try:
             publish_result = publisher.publish(
@@ -155,16 +215,17 @@ async def ingest_vehicle_received_batch(
             total_attempts += publish_result.attempts
             total_duration_ms += publish_result.duration_ms
 
-            update_vehicle_inventory_received_item_status(
-                item_record_id=storage_item.item_record_id,
-                item_status="published",
-                publish_attempts=publish_result.attempts,
-                publish_error=None,
-                redpanda_event_id=item_event_id,
-                redpanda_partition=None,
-                redpanda_offset=None,
-                published_at=utcnow(),
-            )
+            if storage_item is not None:
+                update_vehicle_inventory_received_item_status(
+                    item_record_id=storage_item.item_record_id,
+                    item_status="published",
+                    publish_attempts=publish_result.attempts,
+                    publish_error=None,
+                    redpanda_event_id=item_event_id,
+                    redpanda_partition=None,
+                    redpanda_offset=None,
+                    published_at=utcnow(),
+                )
 
             item_statuses.append(
                 ItemPublishStatus(
@@ -188,16 +249,17 @@ async def ingest_vehicle_received_batch(
             )
             dead_letter_id = dead_letter_id or dlq_result.dead_letter_id
 
-            update_vehicle_inventory_received_item_status(
-                item_record_id=storage_item.item_record_id,
-                item_status="failed",
-                publish_attempts=0,
-                publish_error=str(error),
-                redpanda_event_id=item_event_id,
-                redpanda_partition=None,
-                redpanda_offset=None,
-                published_at=None,
-            )
+            if storage_item is not None:
+                update_vehicle_inventory_received_item_status(
+                    item_record_id=storage_item.item_record_id,
+                    item_status="failed",
+                    publish_attempts=0,
+                    publish_error=str(error),
+                    redpanda_event_id=item_event_id,
+                    redpanda_partition=None,
+                    redpanda_offset=None,
+                    published_at=None,
+                )
 
             item_statuses.append(
                 ItemPublishStatus(
@@ -221,15 +283,16 @@ async def ingest_vehicle_received_batch(
     publish_attempts = total_attempts
     publish_duration_ms = total_duration_ms
 
-    update_publish_status(
-        record_id=storage_result.record_id,
-        publish_status="published" if publish_status == "published" else "dead-lettered",
-        publish_attempts=publish_attempts,
-        publish_last_error=None
-        if publish_status == "published"
-        else "One or more item publishes failed",
-        published_at=utcnow() if publish_status == "published" else None,
-    )
+    if storage_result is not None:
+        update_publish_status(
+            record_id=storage_result.record_id,
+            publish_status="published" if publish_status == "published" else "dead-lettered",
+            publish_attempts=publish_attempts,
+            publish_last_error=None
+            if publish_status == "published"
+            else "One or more item publishes failed",
+            published_at=utcnow() if publish_status == "published" else None,
+        )
 
     idempotency_store.save(
         idempotency_key=idempotency_key,

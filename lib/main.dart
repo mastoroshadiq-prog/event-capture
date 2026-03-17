@@ -154,7 +154,24 @@ class GatewayClient {
           },
           body: jsonEncode(payload),
         )
-        .timeout(const Duration(seconds: 35));
+        .timeout(const Duration(seconds: 90));
+
+    return ApiResult(
+      ok: response.statusCode >= 200 && response.statusCode < 300,
+      statusCode: response.statusCode,
+      body: response.body,
+    );
+  }
+
+  Future<ApiResult> getPoReference({
+    required AppSession session,
+    required String poNumber,
+  }) async {
+    final encodedPo = Uri.encodeComponent(poNumber.trim());
+    final uri = Uri.parse('${session.baseUrl}/v1/events/po/$encodedPo');
+    final response = await _client
+        .get(uri, headers: {'Authorization': 'Bearer ${session.token}'})
+        .timeout(const Duration(seconds: 20));
 
     return ApiResult(
       ok: response.statusCode >= 200 && response.statusCode < 300,
@@ -645,6 +662,76 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
   int _batchTotal = 0;
   final Map<String, String> _itemStatuses = {};
 
+  String _buildDeterministicIdempotencyKey(Map<String, dynamic> payload) {
+    final data = (payload['data'] as Map<String, dynamic>? ?? const {});
+    final items =
+        (data['received_items'] as List? ?? const [])
+            .whereType<Map>()
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList()
+          ..sort(
+            (a, b) => ((a['vin'] ?? '').toString()).compareTo(
+              ((b['vin'] ?? '').toString()),
+            ),
+          );
+
+    final canonicalItems = items
+        .map(
+          (e) =>
+              '${e['vin'] ?? ''}|${e['model'] ?? ''}|${e['odometer'] ?? ''}|${e['condition'] ?? ''}|${e['received_at'] ?? ''}',
+        )
+        .join(';');
+
+    final subject = (payload['subject'] ?? '').toString();
+    final inspectorId =
+        ((data['receiving_context'] as Map<String, dynamic>? ??
+                    const {})['inspector_id'] ??
+                '')
+            .toString();
+    final seed = '$subject|$inspectorId|$canonicalItems';
+    return seed;
+  }
+
+  Future<void> _showSubmitResultDialog({
+    required bool success,
+    required String title,
+    required String message,
+  }) {
+    final color = success ? Colors.green : Colors.red;
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) {
+        return AlertDialog(
+          icon: Icon(
+            success ? Icons.check_circle_rounded : Icons.error_rounded,
+            color: color,
+            size: 30,
+          ),
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _resetForNewScan() {
+    final state = context.read<ReceivingState>();
+    state.resetSession();
+    setState(() {
+      _batchDone = 0;
+      _batchTotal = 0;
+      _itemStatuses.clear();
+      _status = 'Scan QR Surat Jalan (PO) untuk memulai.';
+    });
+  }
+
   @override
   void dispose() {
     _client._client.close();
@@ -658,12 +745,49 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
     if (code == null || code.trim().isEmpty || !mounted) return;
 
     final state = context.read<ReceivingState>();
-    final ok = state.activatePo(code.trim());
-    setState(() {
-      _status = ok
-          ? 'PO aktif: ${state.activePo?.poNumber}. Lanjut scan VIN unit.'
-          : (state.lastError ?? 'PO tidak terdaftar');
-    });
+    final scannedPo = code.trim();
+
+    if (!useRemotePoLookup) {
+      final ok = state.activatePo(scannedPo);
+      setState(() {
+        _status = ok
+            ? 'PO aktif: ${state.activePo?.poNumber}. Lanjut scan VIN unit.'
+            : (state.lastError ?? 'PO tidak terdaftar');
+      });
+      return;
+    }
+
+    setState(() => _status = 'Mengecek PO ke server...');
+    try {
+      final result = await _client.getPoReference(
+        session: widget.session,
+        poNumber: scannedPo,
+      );
+      if (!mounted) return;
+
+      if (!result.ok) {
+        setState(() {
+          _status = result.statusCode == 404
+              ? 'PO tidak ditemukan di master Supabase.'
+              : 'Lookup PO gagal (HTTP ${result.statusCode}).';
+        });
+        return;
+      }
+
+      final payload = _safeDecodeMap(result.body);
+      final ok = state.activatePoFromRemote(payload);
+      setState(() {
+        _status = ok
+            ? 'PO aktif (Supabase): ${state.activePo?.poNumber}. Lanjut scan VIN unit.'
+            : (state.lastError ?? 'Data PO dari server tidak valid');
+      });
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() => _status = 'Timeout saat lookup PO ke server.');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = 'Gagal lookup PO: $e');
+    }
   }
 
   Future<void> _scanVinAndVerify() async {
@@ -807,10 +931,14 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
       final result = await _client.sendVehicleReceived(
         session: widget.session,
         payload: payload,
-        idempotencyKey: _uuid.v4(),
+        idempotencyKey: _buildDeterministicIdempotencyKey(payload),
         correlationId: _uuid.v4(),
       );
       if (!mounted) return;
+      var shouldResetSession = false;
+      var popupSuccess = false;
+      var popupTitle = '';
+      var popupMessage = '';
       setState(() {
         if (result.ok) {
           final body = _safeDecodeMap(result.body);
@@ -843,6 +971,11 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
           }
           _status =
               'Data batch berhasil disimpan & event dipublish ($_batchDone/$_batchTotal).';
+          shouldResetSession = true;
+          popupSuccess = true;
+          popupTitle = 'Submit Berhasil';
+          popupMessage =
+              'Event berhasil dikirim ($_batchDone/$_batchTotal published). Form akan direset untuk scan baru.';
         } else {
           final hasSuccess = _batchDone > 0;
           for (final vin in _itemStatuses.keys) {
@@ -853,8 +986,30 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
           _status = hasSuccess
               ? 'Batch parsial gagal (HTTP ${result.statusCode}): ${result.body}'
               : 'Gagal batch (HTTP ${result.statusCode}): ${result.body}';
+          popupSuccess = false;
+          popupTitle = 'Submit Gagal';
+          popupMessage = _status;
         }
       });
+      await _showSubmitResultDialog(
+        success: popupSuccess,
+        title: popupTitle,
+        message: popupMessage,
+      );
+      if (shouldResetSession && mounted) {
+        _resetForNewScan();
+      }
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _status =
+            'Timeout >90 detik. Data kemungkinan sudah masuk. Silakan cek status batch atau ulang sync jika perlu.';
+      });
+      await _showSubmitResultDialog(
+        success: false,
+        title: 'Submit Timeout',
+        message: _status,
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -865,6 +1020,11 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
         }
         _status = 'Gagal kirim batch: $e';
       });
+      await _showSubmitResultDialog(
+        success: false,
+        title: 'Exception',
+        message: _status,
+      );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -873,27 +1033,55 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
   Widget _statusChip(String status) {
     IconData icon;
     Color color;
+    String label;
     switch (status) {
       case 'success':
-        icon = Icons.check_circle;
-        color = Colors.green;
+        icon = Icons.check_circle_rounded;
+        color = Colors.green.shade700;
+        label = 'Published';
         break;
       case 'failed':
-        icon = Icons.error;
-        color = Colors.red;
+        icon = Icons.error_rounded;
+        color = Colors.red.shade700;
+        label = 'Failed';
         break;
       case 'processing':
-        icon = Icons.sync;
-        color = Colors.blue;
+        icon = Icons.sync_rounded;
+        color = Colors.blue.shade700;
+        label = 'Processing';
+        break;
+      case 'verified':
+        icon = Icons.verified_rounded;
+        color = Colors.teal.shade700;
+        label = 'Verified';
         break;
       default:
-        icon = Icons.schedule;
-        color = Colors.orange;
+        icon = Icons.schedule_rounded;
+        color = Colors.orange.shade700;
+        label = 'Pending';
     }
-    return Chip(
-      avatar: Icon(icon, size: 14, color: color),
-      label: Text(status),
-      visualDensity: VisualDensity.compact,
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontWeight: FontWeight.w600,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -901,20 +1089,114 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
   Widget build(BuildContext context) {
     final state = context.watch<ReceivingState>();
     final po = state.activePo;
+    final theme = Theme.of(context);
+    final progress = state.totalUnits == 0
+        ? 0.0
+        : (state.verifiedCount / state.totalUnits);
+    final statusLower = _status.toLowerCase();
+    final statusColor = statusLower.contains('gagal')
+        ? Colors.red
+        : statusLower.contains('berhasil')
+        ? Colors.green
+        : theme.colorScheme.primary;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('POC Penerimaan Unit')),
+      appBar: AppBar(
+        title: const Text('POC Penerimaan Unit'),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: _busy
+                      ? Colors.orange.withValues(alpha: 0.15)
+                      : Colors.green.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  _busy ? 'SYNCING' : 'READY',
+                  style: TextStyle(
+                    color: _busy
+                        ? Colors.orange.shade800
+                        : Colors.green.shade800,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 11,
+                    letterSpacing: 0.4,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Vehicle Receiving Gateway',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  po == null
+                      ? 'Mulai dengan scan QR Surat Jalan, lanjut verifikasi VIN unit.'
+                      : 'PO aktif ${po.poNumber} • ${state.verifiedCount}/${state.totalUnits} unit verified',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    fontSize: 13,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Tahap 1: Scan PO'),
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.qr_code_2_rounded,
+                        color: theme.colorScheme.primary,
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Tahap 1 · Identifikasi PO',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 8),
+                  Text(
+                    'Scan QR Surat Jalan untuk memuat daftar unit yang diharapkan.',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 10),
                   FilledButton.icon(
                     onPressed: _busy ? null : _scanPo,
                     icon: const Icon(Icons.qr_code_scanner),
@@ -932,11 +1214,31 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('PO: ${po.poNumber}'),
+                    Row(
+                      children: [
+                        const Icon(Icons.description_outlined),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            po.poNumber,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
                     Text('Vendor: ${po.vendorInfo}'),
                     Text('Warehouse: ${po.warehouseId}'),
+                    Text('Tujuan: ${po.destinationBranch}'),
+                    const SizedBox(height: 10),
+                    LinearProgressIndicator(value: progress),
+                    const SizedBox(height: 6),
                     Text(
-                      'Progress: ${state.verifiedCount}/${state.totalUnits} Unit',
+                      'Progress verifikasi: ${state.verifiedCount}/${state.totalUnits} unit',
+                      style: theme.textTheme.bodySmall,
                     ),
                   ],
                 ),
@@ -949,8 +1251,25 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Tahap 2: Verifikasi Unit'),
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.fact_check_outlined,
+                        color: theme.colorScheme.primary,
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Tahap 2 · Verifikasi Unit',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 8),
+                  Text(
+                    'Scan VIN fisik, isi odometer & condition untuk menandai unit verified.',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 10),
                   FilledButton.icon(
                     onPressed: _busy ? null : _scanVinAndVerify,
                     icon: const Icon(Icons.document_scanner),
@@ -969,16 +1288,22 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
                   children: po.units
                       .map(
                         (u) => ListTile(
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
                           leading: Icon(
                             state.isVinVerified(u.vin)
-                                ? Icons.check_circle
-                                : Icons.radio_button_unchecked,
+                                ? Icons.check_circle_rounded
+                                : Icons.radio_button_unchecked_rounded,
                             color: state.isVinVerified(u.vin)
                                 ? Colors.green
                                 : Colors.grey,
                           ),
                           title: Text(u.vin),
-                          subtitle: Text(u.model),
+                          subtitle: Text('${u.model} • ${u.color}'),
+                          trailing: _statusChip(
+                            state.isVinVerified(u.vin) ? 'verified' : 'pending',
+                          ),
                         ),
                       )
                       .toList(),
@@ -990,6 +1315,9 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: _busy ? null : _submitBatch,
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
               icon: _busy
                   ? const SizedBox(
                       width: 16,
@@ -1010,7 +1338,19 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Progress Batch: $_batchDone/$_batchTotal'),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.auto_graph_rounded,
+                          color: theme.colorScheme.primary,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Progress Batch: $_batchDone/$_batchTotal',
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ],
+                    ),
                     const SizedBox(height: 8),
                     LinearProgressIndicator(
                       value: _batchTotal == 0 ? 0 : (_batchDone / _batchTotal),
@@ -1031,10 +1371,19 @@ class _ReceiveUnitPocViewState extends State<_ReceiveUnitPocView> {
           ],
           const SizedBox(height: 10),
           Card(
-            color: const Color(0xFFE8F5E9),
+            color: statusColor.withValues(alpha: 0.10),
             child: Padding(
               padding: const EdgeInsets.all(12),
-              child: Text(_status),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.info_outline_rounded, color: statusColor),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(_status, style: TextStyle(color: statusColor)),
+                  ),
+                ],
+              ),
             ),
           ),
         ],

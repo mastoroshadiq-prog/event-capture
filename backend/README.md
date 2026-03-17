@@ -115,3 +115,66 @@ set AUTH_OPERATOR_ID_CLAIM=sub
 set AUTH_ENFORCE_OPERATOR_MATCH=false
 set AUTH_ENFORCE_DEVICE_MATCH=false
 ```
+
+## Deploy ke Render (Free Plan)
+
+Project ini sudah disiapkan file blueprint Render di root repo: `render.yaml`.
+
+Isi penting blueprint:
+
+- `rootDir: backend`
+- build: `pip install -r requirements.txt`
+- start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- health check: `/health`
+
+### Langkah deploy
+
+1. Push perubahan terbaru ke GitHub.
+2. Di Render, pilih **New +** -> **Blueprint**.
+3. Pilih repository ini, Render akan membaca `render.yaml` otomatis.
+4. Setelah service `event-capture-backend` terbentuk, isi environment variables berikut.
+
+### Environment variables minimum di Render
+
+Auth:
+
+- `AUTH_DISABLE=true` *(untuk POC internal saja, paling cepat)*
+
+Atau jika tetap pakai JWT Supabase:
+
+- `AUTH_DISABLE=false`
+- `AUTH_ISSUER=https://<project-ref>.supabase.co/auth/v1`
+- `AUTH_JWKS_URL=https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json`
+- `AUTH_AUDIENCE=authenticated`
+- `AUTH_REQUIRED_SCOPE=`
+- `AUTH_REQUIRED_ROLE=`
+- `AUTH_OPERATOR_ID_CLAIM=sub`
+- `AUTH_ENFORCE_OPERATOR_MATCH=false`
+- `AUTH_ENFORCE_DEVICE_MATCH=false`
+
+Redpanda:
+
+- `REDPANDA_BOOTSTRAP_SERVERS=<cluster-host>:9092`
+- `REDPANDA_TOPIC=penerimaan_unit`
+- `REDPANDA_SECURITY_PROTOCOL=SASL_SSL`
+- `REDPANDA_SASL_MECHANISM=SCRAM-SHA-256`
+- `REDPANDA_SASL_USERNAME=<username>`
+- `REDPANDA_SASL_PASSWORD=<password>`
+
+Supabase DB:
+
+- `SUPABASE_DB_URL=<postgres-connection-string>`
+
+Opsional tuning:
+
+- `PUBLISH_MAX_RETRIES=3`
+- `PUBLISH_TIMEOUT_SECONDS=5.0`
+- `CIRCUIT_BREAKER_FAILURE_THRESHOLD=5`
+- `CIRCUIT_BREAKER_RESET_SECONDS=30`
+
+### Verifikasi pasca deploy
+
+- Cek health endpoint: `GET https://<render-service>.onrender.com/health`
+- Pastikan status `{"status":"ok"}`.
+- Uji ingest endpoint dari app Flutter dengan base URL Render.
+- Jalankan SQL migration `backend/sql/002_create_vehicle_received_scan_items.sql` di Supabase SQL Editor agar penyimpanan item detail aktif.

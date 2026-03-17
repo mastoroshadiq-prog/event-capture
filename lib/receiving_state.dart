@@ -1,60 +1,81 @@
 import 'package:flutter/foundation.dart';
 
+const bool useRemotePoLookup = true;
+
 const Map<String, dynamic> ssotPoData = {
-  'PO-ARISTA-2026-001': {
+  'PO-ARISTA-2026-003': {
     'vendor_info': 'PT Toyota Astra Motor',
     'carrier_name': 'Sinar Logistic',
-    'description': 'Stock Replenishment - Regular',
+    'description': 'Stock Replenishment - Regular Batch',
     'warehouse_id': 'WH-SDR-01',
     'destination_branch': 'ARISTA Sudirman',
     'units': [
       {
-        'vin': 'MHRM1F1G1PK123456',
-        'engine': '2NR-FE-12345',
+        'vin': 'MHRM1F1G1PK100001',
         'model': 'Avanza 1.5 G CVT',
         'color': 'Silver Metallic',
       },
       {
-        'vin': 'MHRM1F1G1PK123457',
-        'engine': '2NR-FE-12346',
+        'vin': 'MHRM1F1G1PK100002',
         'model': 'Avanza 1.5 G CVT',
         'color': 'Black Metallic',
       },
       {
-        'vin': 'MHRM1F1G1PK123458',
-        'engine': '2NR-FE-12347',
+        'vin': 'MHRM1F1G1PK100003',
         'model': 'Avanza 1.5 G CVT',
         'color': 'White Pearl',
       },
+      {
+        'vin': 'MHRM1F1G1PK100004',
+        'model': 'Avanza 1.5 G CVT',
+        'color': 'Grey Metallic',
+      },
+      {
+        'vin': 'MHRM1F1G1PK100005',
+        'model': 'Avanza 1.5 G CVT',
+        'color': 'Blue Metallic',
+      },
     ],
   },
-  'PO-ARISTA-2026-002': {
-    'vendor_info': 'PT Astra Daihatsu Motor',
+  'PO-ARISTA-2026-004': {
+    'vendor_info': 'PT Toyota Astra Motor',
     'carrier_name': 'Internal Drive',
-    'description': 'Customer Order - Bpk. Budi',
+    'description': 'Customer Order - Priority VIP',
     'warehouse_id': 'WH-SDR-02',
     'destination_branch': 'ARISTA Sudirman',
     'units': [
       {
-        'vin': 'MHRK2F1G1RK987654',
-        'engine': '1KR-VET-88776',
-        'model': 'Raize 1.0 Turbo GR',
+        'vin': 'MHRK2F1G1RK000999',
+        'model': 'Toyota Raize 1.0 Turbo',
         'color': 'Red Black Roof',
+      },
+    ],
+  },
+  'PO-ARISTA-2026-005': {
+    'vendor_info': 'PT Astra Daihatsu Motor',
+    'carrier_name': 'Fleet Transport Service',
+    'description': 'Fleet Order - Project ARISTA',
+    'warehouse_id': 'WH-SDR-01',
+    'destination_branch': 'ARISTA Sudirman',
+    'units': [
+      {
+        'vin': 'MHRB3F1G1SK000111',
+        'model': 'Daihatsu Sigra 1.2 R',
+        'color': 'White',
+      },
+      {
+        'vin': 'MHRB3F1G1SK000222',
+        'model': 'Daihatsu Sigra 1.2 R',
+        'color': 'Bronze Metallic',
       },
     ],
   },
 };
 
 class PoUnit {
-  const PoUnit({
-    required this.vin,
-    required this.engine,
-    required this.model,
-    required this.color,
-  });
+  const PoUnit({required this.vin, required this.model, required this.color});
 
   final String vin;
-  final String engine;
   final String model;
   final String color;
 }
@@ -123,7 +144,41 @@ class ReceivingState extends ChangeNotifier {
         .map(
           (row) => PoUnit(
             vin: (row['vin'] ?? '').toString(),
-            engine: (row['engine'] ?? '').toString(),
+            model: (row['model'] ?? '').toString(),
+            color: (row['color'] ?? '').toString(),
+          ),
+        )
+        .toList();
+
+    _activePo = PoContext(
+      poNumber: key,
+      vendorInfo: (raw['vendor_info'] ?? '-').toString(),
+      carrierName: (raw['carrier_name'] ?? '-').toString(),
+      description: (raw['description'] ?? '-').toString(),
+      warehouseId: (raw['warehouse_id'] ?? '-').toString(),
+      destinationBranch: (raw['destination_branch'] ?? '-').toString(),
+      units: units,
+    );
+    _verifiedByVin.clear();
+    _lastError = null;
+    notifyListeners();
+    return true;
+  }
+
+  bool activatePoFromRemote(Map<String, dynamic> raw) {
+    final key = (raw['po_number'] ?? '').toString().trim();
+    if (key.isEmpty) {
+      _lastError = 'PO tidak valid dari server';
+      notifyListeners();
+      return false;
+    }
+
+    final unitsRaw = (raw['units'] as List?) ?? const [];
+    final units = unitsRaw
+        .whereType<Map>()
+        .map(
+          (row) => PoUnit(
+            vin: (row['vin'] ?? '').toString(),
             model: (row['model'] ?? '').toString(),
             color: (row['color'] ?? '').toString(),
           ),
@@ -182,7 +237,7 @@ class ReceivingState extends ChangeNotifier {
     return true;
   }
 
-  Map<String, dynamic>? generateCloudEvent({required String inspectorId}) {
+  Map<String, dynamic>? buildCloudEvent({required String inspectorId}) {
     final po = _activePo;
     if (po == null || _verifiedByVin.isEmpty) {
       return null;
@@ -215,5 +270,16 @@ class ReceivingState extends ChangeNotifier {
             .toList(),
       },
     };
+  }
+
+  Map<String, dynamic>? generateCloudEvent({required String inspectorId}) {
+    return buildCloudEvent(inspectorId: inspectorId);
+  }
+
+  void resetSession() {
+    _activePo = null;
+    _verifiedByVin.clear();
+    _lastError = null;
+    notifyListeners();
   }
 }

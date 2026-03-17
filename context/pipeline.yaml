@@ -1,0 +1,121 @@
+output:
+  label: "supabase_sink"
+  sql_raw:
+    driver: "postgres"
+    # Gunakan format Key-Value Pair di bawah ini:
+    dsn: "host=aws-1-ap-south-1.pooler.supabase.com port=6543 user=postgres.rwejounbedmgyvuxpcuj password=ikinpass@word1 dbname=postgres sslmode=require"
+    query: |
+      /*
+        Parent + child upsert untuk event fan-out per item:
+        - event id berformat: <scan_uuid>:<vin>
+        - scan_id (UUID) = bagian sebelum ':'
+      */
+      WITH upsert_parent AS (
+        INSERT INTO public.vehicle_received_scans (
+          id,
+          purchase_order,
+          vendor_id,
+          operator_id,
+          product_id,
+          vin_number,
+          condition_notes,
+          landed_cost_actual,
+          event_type,
+          source,
+          correlation_id,
+          idempotency_key,
+          payload,
+          submit_status,
+          publish_status,
+          scanned_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1::uuid,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $10,
+          $11,
+          $12,
+          $13::jsonb,
+          'saved',
+          'published',
+          $14,
+          now(),
+          now()
+        )
+        ON CONFLICT (id)
+        DO UPDATE SET
+          payload = EXCLUDED.payload,
+          publish_status = 'published',
+          updated_at = now()
+      )
+      INSERT INTO public.vehicle_received_scan_items (
+        scan_id,
+        vin,
+        model,
+        odometer,
+        condition_score,
+        received_at,
+        redpanda_event_id,
+        redpanda_partition,
+        redpanda_offset,
+        item_status,
+        publish_attempts,
+        published_at
+      ) VALUES (
+        $1::uuid,
+        $6,
+        $5,
+        $15,
+        $7,
+        $14,
+        $16,
+        $17,
+        $18,
+        'published',
+        1,
+        now()
+      )
+      ON CONFLICT (scan_id, vin)
+      DO UPDATE SET
+        model = EXCLUDED.model,
+        odometer = EXCLUDED.odometer,
+        condition_score = EXCLUDED.condition_score,
+        received_at = EXCLUDED.received_at,
+        redpanda_event_id = EXCLUDED.redpanda_event_id,
+        redpanda_partition = EXCLUDED.redpanda_partition,
+        redpanda_offset = EXCLUDED.redpanda_offset,
+        item_status = 'published',
+        publish_attempts = public.vehicle_received_scan_items.publish_attempts + 1,
+        published_at = now(),
+        updated_at = now();
+    args_mapping: |
+      root = [
+        this.id.split(":").index(0),                                        # $1 scan_id (UUID parent)
+        this.subject.or("UNKNOWN-PO"),                                       # $2 purchase_order
+        "pipeline-redpanda-connect",                                         # $3 vendor_id (fallback)
+        this.data.receiving_context.inspector_id.or("pipeline-unknown"),     # $4 operator_id
+        this.data.received_items.index(0).model.or("UNKNOWN-MODEL"),          # $5 product_id / model
+        this.data.received_items.index(0).vin,                                 # $6 vin_number
+        this.data.received_items.index(0).condition.or("Grade A"),            # $7 condition_notes / condition_score
+        0,                                                                     # $8 landed_cost_actual
+        this.type,                                                             # $9 event_type
+        this.source,                                                           # $10 source
+        meta("correlation_id").or(this.id),                                    # $11 correlation_id
+        this.subject.or("UNKNOWN-PO") + "|" + this.data.received_items.index(0).vin, # $12 idempotency_key item-level
+        this.format_json(),                                                    # $13 payload json string
+        this.data.received_items.index(0).received_at.or(this.time),           # $14 scanned_at/received_at
+        this.data.received_items.index(0).odometer.or(0),                      # $15 odometer
+        this.id,                                                               # $16 redpanda_event_id
+        meta("kafka_partition").number().or(0),                                # $17 redpanda_partition
+        meta("kafka_offset").number().or(0)                                    # $18 redpanda_offset
+      ]
+    max_in_flight: 64
