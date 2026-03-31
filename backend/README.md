@@ -116,6 +116,46 @@ set AUTH_ENFORCE_OPERATOR_MATCH=false
 set AUTH_ENFORCE_DEVICE_MATCH=false
 ```
 
+## Integrasi Odoo JSON-RPC (Tahap 2)
+
+Backend ini sekarang menyediakan bridge API ke Odoo JSON-RPC.
+
+### Environment variable Odoo
+
+- `ODOO_BASE_URL` (contoh: `https://your-odoo-domain.com`)
+- `ODOO_DATABASE` (nama database Odoo)
+- `ODOO_USERNAME` (email/login user integrasi)
+- `ODOO_API_KEY` (API key dari profile user Odoo)
+
+Opsional:
+
+- `ODOO_TIMEOUT_SECONDS` (default: `15.0`)
+- `ODOO_VERIFY_SSL` (default: `true`, set `false` hanya untuk dev/test)
+
+### Endpoint baru
+
+- `GET /v1/integrations/odoo/health`
+  - Mengecek konektivitas dan autentikasi ke Odoo (JSON-RPC authenticate).
+
+- `POST /v1/integrations/odoo/goods-received/sync`
+  - Input body: payload `GoodsReceivedVerifiedCloudEvent`.
+  - Proses:
+    1. Cari `purchase.order` berdasarkan `subject`.
+    2. Cari receipt incoming yang masih open.
+    3. Cari product dari `data.product_id` (default code, fallback name).
+    4. Cari/buat `stock.lot` dari VIN.
+    5. Tulis jejak event ke chatter PO.
+
+- `POST /v1/integrations/odoo/jsonrpc/execute`
+  - Endpoint helper untuk mengeksekusi method `execute_kw` secara generik.
+  - Berguna untuk eksperimen mapping model/method Odoo dari sisi integrasi.
+
+### Catatan penting
+
+- Endpoint Odoo di backend mengikuti auth dependency yang sama seperti endpoint ingest.
+- Untuk PoC internal paling cepat, bisa pakai `AUTH_DISABLE=true`.
+- Nilai kondisi unit saat ini dicatat pada chatter PO sebagai jejak event, dan bisa diperluas ke custom field Odoo pada iterasi berikutnya.
+
 ## Deploy ke Render (Free Plan)
 
 Project ini sudah disiapkan file blueprint Render di root repo: `render.yaml`.

@@ -113,6 +113,12 @@ class Settings:
     dead_letter_dir: str
     supabase_db_url: str | None
     event_first_mode: bool
+    odoo_base_url: str | None
+    odoo_database: str | None
+    odoo_username: str | None
+    odoo_api_key: str | None
+    odoo_timeout_seconds: float
+    odoo_verify_ssl: bool
 
 
 @lru_cache
@@ -175,5 +181,11 @@ def get_settings() -> Settings:
         dead_letter_dir=getenv("DEAD_LETTER_DIR", "backend/dead_letter"),
         supabase_db_url=_get_optional_str_env("SUPABASE_DB_URL", _get_optional_str_env("DATABASE_URL")),
         event_first_mode=_get_bool_env("EVENT_FIRST_MODE", False),
+        odoo_base_url=_get_optional_str_env("ODOO_BASE_URL"),
+        odoo_database=_get_optional_str_env("ODOO_DATABASE"),
+        odoo_username=_get_optional_str_env("ODOO_USERNAME"),
+        odoo_api_key=_get_optional_str_env("ODOO_API_KEY"),
+        odoo_timeout_seconds=max(1.0, _get_float_env("ODOO_TIMEOUT_SECONDS", 15.0)),
+        odoo_verify_ssl=_get_bool_env("ODOO_VERIFY_SSL", True),
     )
 

@@ -1,0 +1,36 @@
+input:
+  label: redpanda_penerimaan_unit
+  redpanda:
+    seed_brokers:
+      - ${secrets.REDPANDA_BROKER}
+    tls:
+      enabled: true
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: ${secrets.KAFKA_USER_ODOO}
+        password: ${secrets.KAFKA_PASSWORD_ODOO}
+    topics:
+      - penerimaan_unit
+    regexp_topics: false
+    transaction_isolation_level: read_committed
+    consumer_group: odoo-bridge-sync-v1
+    auto_replay_nacks: true
+
+pipeline:
+  processors:
+    - mapping: |
+        root = this
+
+output:
+  label: backend_odoo_sync
+  http_client:
+    url: ${secrets.BACKEND_SYNC_URL}
+    verb: POST
+    headers:
+      Content-Type: application/json
+      Authorization: ${secrets.BACKEND_AUTH_HEADER}
+    timeout: 20s
+    max_in_flight: 8
+    retries: 5
+    retry_period: 2s
+    max_retry_backoff: 30s

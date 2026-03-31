@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from app.api.routes_events import router as events_router
+from app.api.routes_odoo import router as odoo_router
 
 
 app = FastAPI(
@@ -13,6 +14,7 @@ app = FastAPI(
 )
 
 app.include_router(events_router)
+app.include_router(odoo_router)
 
 
 @app.get("/health", tags=["health"])
